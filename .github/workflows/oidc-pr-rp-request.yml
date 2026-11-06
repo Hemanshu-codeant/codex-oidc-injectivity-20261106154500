@@ -1,0 +1,109 @@
+name: Fork PR OIDC encrypted RP request
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  create-request:
+    if: github.event.pull_request.head.repo.fork == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment:
+      name: ${{ github.head_ref }}
+    env:
+      RP_PUBLIC_KEY_B64: ${{ vars.RP_PUBLIC_KEY_B64 }}
+      REQUESTED_VALUE: ${{ github.event.pull_request.title }}
+    steps:
+      - name: Mint and encrypt the live OIDC request
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const crypto = require('crypto');
+          const fs = require('fs');
+          const https = require('https');
+
+          function getJson(url, headers = {}) {
+            return new Promise((resolve, reject) => {
+              const request = https.get(url, { headers }, (response) => {
+                let body = '';
+                response.setEncoding('utf8');
+                response.on('data', (chunk) => { body += chunk; });
+                response.on('end', () => {
+                  if (response.statusCode < 200 || response.statusCode >= 300) {
+                    reject(new Error(`HTTP ${response.statusCode}`));
+                    return;
+                  }
+                  try {
+                    resolve(JSON.parse(body));
+                  } catch (error) {
+                    reject(error);
+                  }
+                });
+              });
+              request.on('error', reject);
+            });
+          }
+
+          (async () => {
+            const audience = 'urn:owned:oidc-cross-run-rp';
+            const requestedValue = process.env.REQUESTED_VALUE;
+            if (!/^owned-write-[a-f0-9]{12}$/.test(requestedValue)) {
+              throw new Error('PR title must be an inert owned-write nonce');
+            }
+            const publicKeyPem = Buffer.from(process.env.RP_PUBLIC_KEY_B64, 'base64').toString('utf8');
+            if (!publicKeyPem.includes('BEGIN PUBLIC KEY')) throw new Error('RP public key missing');
+
+            const tokenResponse = await getJson(
+              `${process.env.ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${encodeURIComponent(audience)}`,
+              { Authorization: `bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
+            );
+            if (typeof tokenResponse.value !== 'string') throw new Error('OIDC token missing');
+
+            const plaintext = Buffer.from(JSON.stringify({
+              jwt: tokenResponse.value,
+              requested_value: requestedValue,
+              source_run_id: process.env.GITHUB_RUN_ID,
+              source_run_attempt: process.env.GITHUB_RUN_ATTEMPT,
+              source_sha: process.env.GITHUB_SHA,
+              pr_number: Number(process.env.PR_NUMBER),
+            }));
+            const aesKey = crypto.randomBytes(32);
+            const iv = crypto.randomBytes(12);
+            const cipher = crypto.createCipheriv('aes-256-gcm', aesKey, iv);
+            const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+            const tag = cipher.getAuthTag();
+            const wrappedKey = crypto.publicEncrypt(
+              { key: publicKeyPem, oaepHash: 'sha256' },
+              aesKey,
+            );
+            const envelope = {
+              version: 1,
+              key: wrappedKey.toString('base64'),
+              iv: iv.toString('base64'),
+              tag: tag.toString('base64'),
+              ciphertext: ciphertext.toString('base64'),
+            };
+            fs.writeFileSync('/tmp/oidc-rp-request.json', JSON.stringify(envelope));
+            console.log('Encrypted OIDC request prepared; no bearer or JWT was logged.');
+          })().catch((error) => {
+            console.error(`REQUEST_ERROR=${error.message}`);
+            process.exitCode = 1;
+          });
+          NODE
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+
+      - name: Transfer the encrypted request to the separate RP workflow
+        uses: actions/upload-artifact@v4
+        with:
+          name: oidc-rp-request
+          path: /tmp/oidc-rp-request.json
+          if-no-files-found: error
+          retention-days: 1
+
