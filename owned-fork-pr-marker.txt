@@ -1,3 +1,4 @@
 Synthetic owned-account fork pull request for a non-destructive OIDC subject-collision authorization test.
 Second synthetic revision records the trusted base-workflow identity claims.
 Third synthetic revision exercises the owned relying-party marker exchange.
+Fourth synthetic revision proves and restores an owned protected-state write.
