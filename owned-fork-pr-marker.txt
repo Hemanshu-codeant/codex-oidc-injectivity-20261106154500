@@ -1,1 +1,2 @@
 Synthetic owned-account fork pull request for a non-destructive OIDC subject-collision authorization test.
+Second synthetic revision records the trusted base-workflow identity claims.
