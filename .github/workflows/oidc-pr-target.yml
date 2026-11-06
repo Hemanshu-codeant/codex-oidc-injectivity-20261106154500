@@ -89,6 +89,12 @@ jobs:
               sub: claims.sub,
               event_name: claims.event_name,
               head_ref: claims.head_ref,
+              base_ref: claims.base_ref,
+              ref: claims.ref,
+              repository: claims.repository,
+              repository_id: claims.repository_id,
+              workflow_ref: claims.workflow_ref,
+              workflow_sha: claims.workflow_sha,
               actor_id: claims.actor_id,
               aud: claims.aud,
             };
