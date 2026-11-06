@@ -11,7 +11,7 @@ jobs:
   policy-check:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    environment: 'Critical:Prod'
+    environment: 'Critical%3AProd'
     steps:
       - name: Verify signature and emulate exact-sub trust policy
         shell: bash
