@@ -32,6 +32,8 @@ jobs:
           const protectedMarker = `owned-prod-marker-${crypto.randomBytes(24).toString('hex')}`;
           const markerSha256 = crypto.createHash('sha256').update(protectedMarker).digest('hex');
           const sessions = new Set();
+          const initialProtectedState = 'stable-production-state';
+          let protectedState = initialProtectedState;
 
           function getJson(url) {
             return new Promise((resolve, reject) => {
@@ -115,7 +117,7 @@ jobs:
               if (request.method === 'GET' && request.url === '/protected-marker') {
                 const auth = request.headers.authorization || '';
                 const accessToken = auth.startsWith('Bearer ') ? auth.slice('Bearer '.length) : '';
-                if (!sessions.delete(accessToken)) {
+                if (!sessions.has(accessToken)) {
                   send(response, 403, { error: 'valid RP session required' });
                   return;
                 }
@@ -123,6 +125,38 @@ jobs:
                   protected_marker: protectedMarker,
                   marker_sha256: markerSha256,
                   production_read_authorized: true,
+                });
+                return;
+              }
+              if (request.method === 'POST' && request.url === '/protected-state') {
+                const auth = request.headers.authorization || '';
+                const accessToken = auth.startsWith('Bearer ') ? auth.slice('Bearer '.length) : '';
+                if (!sessions.has(accessToken)) {
+                  send(response, 403, { error: 'valid RP session required' });
+                  return;
+                }
+                const before = protectedState;
+                protectedState = `owned-test-write-${crypto.randomBytes(12).toString('hex')}`;
+                send(response, 200, {
+                  production_write_authorized: true,
+                  before,
+                  after: protectedState,
+                });
+                return;
+              }
+              if (request.method === 'POST' && request.url === '/restore-state') {
+                const auth = request.headers.authorization || '';
+                const accessToken = auth.startsWith('Bearer ') ? auth.slice('Bearer '.length) : '';
+                if (!sessions.delete(accessToken)) {
+                  send(response, 403, { error: 'valid RP session required' });
+                  return;
+                }
+                const before = protectedState;
+                protectedState = initialProtectedState;
+                send(response, 200, {
+                  state_restored: true,
+                  before,
+                  after: protectedState,
                 });
                 return;
               }
@@ -168,11 +202,25 @@ jobs:
               -H "Authorization: Bearer ${access_token}" \
               http://127.0.0.1:43117/protected-marker
           })"
+          write_response="$({
+            curl --fail-with-body --silent --show-error \
+              -X POST \
+              -H "Authorization: Bearer ${access_token}" \
+              http://127.0.0.1:43117/protected-state
+          })"
+          restore_response="$({
+            curl --fail-with-body --silent --show-error \
+              -X POST \
+              -H "Authorization: Bearer ${access_token}" \
+              http://127.0.0.1:43117/restore-state
+          })"
 
           result="$({
             jq -cn \
               --argjson exchange "$exchange_response" \
               --argjson protected "$protected_response" \
+              --argjson write "$write_response" \
+              --argjson restore "$restore_response" \
               '{
                 rp_exchange_succeeded:true,
                 authenticated_sub:$exchange.authenticated_sub,
@@ -180,7 +228,12 @@ jobs:
                 actor_id:$exchange.actor_id,
                 production_read_authorized:$protected.production_read_authorized,
                 protected_marker:$protected.protected_marker,
-                marker_sha256:$protected.marker_sha256
+                marker_sha256:$protected.marker_sha256,
+                production_write_authorized:$write.production_write_authorized,
+                protected_state_before:$write.before,
+                protected_state_after:$write.after,
+                state_restored:$restore.state_restored,
+                restored_state:$restore.after
               }'
           })"
           printf 'OIDC_RP_IMPACT=%s\n' "$result"
